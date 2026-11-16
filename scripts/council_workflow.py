@@ -36,7 +36,7 @@ SEATS = A.get("seats") or ["inherit", "pro"]
 for s in SEATS:
     if s not in VALID_TIERS:
         raise ValueError(f"Unknown seat tier {s!r}; use one of {sorted(VALID_TIERS)}")
-MAX_ROUNDS = int(A.get("max_rounds") or 3)
+MAX_ROUNDS = int(A.get("max_rounds") or 2)
 ALLOW_TOOLS = A.get("allow_tools", True)
 OUT_DIR = A.get("out_dir") or os.path.join(os.getcwd(), "council_runs")
 RUN_ID = time.strftime("%Y%m%d-%H%M%S")
@@ -229,7 +229,8 @@ STANDING = (
 
 
 def norm(s):
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    lines = (s or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
 
 
 async def run_consensus():

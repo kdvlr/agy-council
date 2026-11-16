@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Helper state machine for running Council (Mode 1 & Mode 2) over Antigravity `swarm`.
+"""State helper for running Council (Mode 1 & Mode 2) over Antigravity `swarm`.
 
 Keeps all prompts, answers, anonymized peer reviews, and blind consensus drafts in
 local files under `<out_dir>/<mode>-<timestamp>-<tag>/` so nothing leaks onto the
-shared swarm message board. The swarm board is used strictly as a wakeup doorbell.
+shared swarm message board. The swarm board is used strictly for barrier pings.
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import fcntl
 import json
 import os
 import random
 import re
 import secrets
-import sys
 import time
 from typing import Any, Dict, List
 
@@ -39,6 +39,8 @@ DISPLAY_NAMES = {
     "gpt-oss-120b-medium": "GPT-OSS 120B (Medium)",
 }
 
+HELPER_PATH = os.path.abspath(__file__)
+
 
 def pretty_model(model_id: str) -> str:
     return DISPLAY_NAMES.get(model_id, model_id)
@@ -52,8 +54,10 @@ def letters(n: int) -> List[str]:
     return [chr(ord("A") + i) for i in range(n)]
 
 
-def norm_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+def norm_plan(text: str) -> str:
+    """Normalize line endings and trailing spaces while preserving indentation."""
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
 
 
 def read_text(path: str) -> str:
@@ -106,28 +110,64 @@ def tools_instruction(allow_tools: bool) -> str:
             "and NEVER call `read_board` or `swarm`."
         )
     return (
-        "Answer strictly from the prompt below without reading workspace files. "
+        "Answer strictly from the prompt and `<context>` below without reading workspace files. "
         "Only use `read_file` on your assigned prompt file, `write_file` on your assigned "
-        "output file, and `post_message` for your 1-line completion ping. NEVER call `read_board` or `swarm`."
+        "output file(s), `run_command` only for the `mark-done` helper if instructed, and "
+        "`post_message` for barrier pings. NEVER call `read_board` or `swarm`."
     )
 
 
-def worker_brief(worker_name: str, prompt_path: str, output_path: str, ping_tag: str) -> str:
+def barrier_brief(
+    worker_name: str,
+    run_dir: str,
+    stage: str,
+    seat_idx: int,
+    prompt_path: str,
+    output_path: str,
+) -> str:
     return (
         f"You are an isolated deliberation participant (`{worker_name}`). "
         f"STRICT RULES: Never call `read_board` and never call `swarm`. Never post any "
         f"answer, critique, or plan text to the board. "
         f"1) Read `{prompt_path}`. "
-        f"2) Write your complete output ONLY to `{output_path}` (overwrite if needed). "
+        f"2) Write your complete output ONLY to `{output_path}`. "
+        f'3) Run `python3 "{HELPER_PATH}" mark-done --run-dir "{run_dir}" --stage {stage} --seat {seat_idx}` '
+        f"and if it returns `ping` (non-empty), call `post_message` with that exact `ping` text; otherwise end your turn silently."
+    )
+
+
+def direct_brief(worker_name: str, prompt_path: str, output_desc: str, ping_tag: str) -> str:
+    return (
+        f"You are an isolated deliberation participant (`{worker_name}`). "
+        f"STRICT RULES: Never call `read_board` and never call `swarm`. Never post any "
+        f"answer, critique, or plan text to the board. "
+        f"1) Read `{prompt_path}`. "
+        f"2) Write your output ONLY to {output_desc}. "
         f"3) Call `post_message` with exact text `@coordinator {ping_tag}` and end your turn."
     )
 
 
-def wakeup_message(worker_name: str, prompt_path: str, output_path: str, ping_tag: str) -> str:
+def barrier_wakeup(
+    worker_name: str,
+    run_dir: str,
+    stage: str,
+    seat_idx: int,
+    prompt_path: str,
+    output_path: str,
+) -> str:
     return (
-        f"@{worker_name} Read `{prompt_path}`, follow its instructions, write your output "
-        f"ONLY to `{output_path}` (never to the board, never call `read_board`), then "
-        f"`post_message` exact text `@coordinator {ping_tag}`."
+        f"@{worker_name} Read `{prompt_path}`, write your output ONLY to `{output_path}` "
+        f"(never to the board, never call `read_board`), then run "
+        f'`python3 "{HELPER_PATH}" mark-done --run-dir "{run_dir}" --stage {stage} --seat {seat_idx}`. '
+        f"If `ping` is non-empty, call `post_message` with that exact text; otherwise end your turn silently."
+    )
+
+
+def direct_wakeup(worker_name: str, prompt_path: str, output_desc: str, ping_tag: str) -> str:
+    return (
+        f"@{worker_name} Read `{prompt_path}`, write your output ONLY to {output_desc} "
+        f"(never to the board, never call `read_board`), then `post_message` exact text "
+        f"`@coordinator {ping_tag}`."
     )
 
 
@@ -160,6 +200,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     t_note = tools_instruction(args.allow_tools)
 
     if mode == "council":
+        # Default to fast mode when N == 2 unless --peer-review is explicitly requested.
+        peer_review = bool(args.peer_review or len(seats) >= 3)
         workers = [f"seat{i}-{tag}" for i in range(len(seats))]
         add_calls = []
         expected_outputs = []
@@ -181,12 +223,13 @@ def cmd_init(args: argparse.Namespace) -> None:
                 {
                     "name": workers[i],
                     "model": model_id,
-                    "brief": worker_brief(workers[i], p_path, o_path, f"stage1 {i} done"),
+                    "brief": barrier_brief(workers[i], run_dir, "stage1", i, p_path, o_path),
                 }
             )
 
         state = {
             "mode": "council",
+            "peer_review": peer_review,
             "tag": tag,
             "run_dir": run_dir,
             "question": question,
@@ -195,12 +238,14 @@ def cmd_init(args: argparse.Namespace) -> None:
             "seats": seats,
             "workers": workers,
             "stage": "stage1",
+            "expected_stage_outputs": {"stage1": expected_outputs},
         }
         save_state(run_dir, state)
         print(
             json.dumps(
                 {
                     "status": "stage1_ready",
+                    "peer_review": peer_review,
                     "run_dir": run_dir,
                     "swarm_add": add_calls,
                     "expected_outputs": expected_outputs,
@@ -217,19 +262,17 @@ def cmd_init(args: argparse.Namespace) -> None:
     p1_model = seats[slot_order[0]]
 
     p_path = os.path.join(run_dir, "prompts", "turn_1.md")
-    o_path = os.path.join(run_dir, "outputs", "turn_1.json")
+    meta_path = os.path.join(run_dir, "outputs", "turn_1.meta.json")
+    plan_path = os.path.join(run_dir, "outputs", "turn_1.plan.md")
     prompt = (
         "# Planning Session — Turn 1\n\n"
         "You are working one-on-one to craft a rigorous, production-grade plan in Markdown.\n"
         f"{t_note}{ctx_block}\n\n"
         f"<request>\n{question}\n</request>\n\n"
-        "Write a JSON object (no surrounding prose) to "
-        f"`{o_path}` with these exact keys:\n"
-        '{\n'
-        '  "revision_notes": "Key design choices and rationale for this initial draft.",\n'
-        '  "plan": "<Complete standalone canonical Markdown plan>",\n'
-        '  "agreed": false\n'
-        '}\n'
+        "Write TWO files:\n"
+        f"1. `{plan_path}` — the complete standalone canonical Markdown plan.\n"
+        f"2. `{meta_path}` — a JSON object:\n"
+        '   `{"revision_notes": "Key design choices and rationale for this initial draft.", "agreed": false}`\n'
     )
     write_text(p_path, prompt)
 
@@ -242,7 +285,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         "allow_tools": args.allow_tools,
         "max_rounds": args.max_rounds,
         "seats": seats,
-        "slot_order": slot_order,  # participant index p -> seat index
+        "slot_order": slot_order,
         "workers": workers,
         "spawned_participants": [0],
         "turns_used": [0] * len(seats),
@@ -265,15 +308,46 @@ def cmd_init(args: argparse.Namespace) -> None:
                     {
                         "name": workers[0],
                         "model": p1_model,
-                        "brief": worker_brief(workers[0], p_path, o_path, "turn 1 done"),
+                        "brief": direct_brief(
+                            workers[0], p_path, f"`{plan_path}` and `{meta_path}`", "turn 1 done"
+                        ),
                     }
                 ],
                 "post_messages": [],
-                "expected_outputs": [o_path],
+                "expected_outputs": [meta_path, plan_path],
             },
             indent=2,
         )
     )
+
+
+# ─────────────────────────── BARRIER HELPER ──────────────────────────
+
+
+def cmd_mark_done(args: argparse.Namespace) -> None:
+    lock_path = os.path.join(args.run_dir, f".{args.stage}.lock")
+    done_path = os.path.join(args.run_dir, f".{args.stage}.pinged")
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_state(args.run_dir)
+            expected = state.get("expected_stage_outputs", {}).get(args.stage, [])
+            if not expected:
+                n = len(state["seats"])
+                ext = "md" if args.stage == "stage1" else "json"
+                expected = [
+                    os.path.join(args.run_dir, "outputs", f"{args.stage}_{i}.{ext}")
+                    for i in range(n)
+                ]
+            all_present = all(os.path.exists(p) and os.path.getsize(p) > 0 for p in expected)
+            if all_present and not os.path.exists(done_path):
+                write_text(done_path, f"seat={args.seat}\n")
+                ping = f"@coordinator {args.stage} all done"
+                print(json.dumps({"all_done": True, "ping": ping}))
+            else:
+                print(json.dumps({"all_done": all_present, "ping": ""}))
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 # ─────────────────────────── MODE 1 STAGES ───────────────────────────
@@ -326,11 +400,12 @@ def cmd_prepare_reviews(args: argparse.Namespace) -> None:
         )
         write_text(p_path, prompt)
         expected_outputs.append(o_path)
-        post_messages.append(wakeup_message(workers[r], p_path, o_path, f"stage2 {r} done"))
+        post_messages.append(barrier_wakeup(workers[r], args.run_dir, "stage2", r, p_path, o_path))
 
     state["answers"] = answers
     state["review_mappings"] = review_mappings
     state["stage"] = "stage2"
+    state.setdefault("expected_stage_outputs", {})["stage2"] = expected_outputs
     save_state(args.run_dir, state)
 
     print(
@@ -345,57 +420,94 @@ def cmd_prepare_reviews(args: argparse.Namespace) -> None:
     )
 
 
+def _clamp_score(val: Any, default: int = 5) -> int:
+    try:
+        num = int(round(float(val)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(10, num))
+
+
 def cmd_prepare_chairman(args: argparse.Namespace) -> None:
     state = load_state(args.run_dir)
     seats = state["seats"]
-    workers = state["workers"]
-    answers = state["answers"]
-    review_mappings = state["review_mappings"]
     n = len(seats)
 
+    answers = state.get("answers") or []
+    if not answers:
+        for i in range(n):
+            ans_path = os.path.join(args.run_dir, "outputs", f"stage1_{i}.md")
+            if not os.path.exists(ans_path):
+                raise SystemExit(f"Missing Stage 1 output: {ans_path}")
+            answers.append(read_text(ans_path).strip())
+        state["answers"] = answers
+
     reviews: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(n)}
-    for r in range(n):
-        o_path = os.path.join(args.run_dir, "outputs", f"stage2_{r}.json")
-        if not os.path.exists(o_path):
-            raise SystemExit(f"Missing Stage 2 output: {o_path}")
-        items = parse_json_lenient(read_text(o_path))
-        if isinstance(items, dict) and "reviews" in items:
-            items = items["reviews"]
-        mapping = review_mappings[str(r)]
-        for item in items:
-            lab = str(item.get("label", "")).strip().upper()[:1]
-            if lab not in mapping:
-                continue
-            target = mapping[lab]
-            reviews[target].append(
+    leaderboard: List[Dict[str, Any]] = []
+
+    if state.get("peer_review", True) and os.path.exists(
+        os.path.join(args.run_dir, "outputs", "stage2_0.json")
+    ):
+        review_mappings = state["review_mappings"]
+        reviewer_totals: Dict[int, List[float]] = {r: [] for r in range(n)}
+        for r in range(n):
+            o_path = os.path.join(args.run_dir, "outputs", f"stage2_{r}.json")
+            if not os.path.exists(o_path):
+                raise SystemExit(f"Missing Stage 2 output: {o_path}")
+            items = parse_json_lenient(read_text(o_path))
+            if isinstance(items, dict) and "reviews" in items:
+                items = items["reviews"]
+            if not isinstance(items, list):
+                raise SystemExit(f"Stage 2 output for seat {r} is not a JSON list")
+            mapping = review_mappings[str(r)]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                lab = str(item.get("label", "")).strip().upper()[:1]
+                if lab not in mapping:
+                    continue
+                target = mapping[lab]
+                acc = _clamp_score(item.get("accuracy"))
+                ins = _clamp_score(item.get("insight"))
+                crit = str(item.get("critique") or "").strip()
+                reviewer_totals[r].append(float(acc + ins))
+                reviews[target].append(
+                    {
+                        "reviewer": r,
+                        "accuracy": acc,
+                        "insight": ins,
+                        "critique": crit,
+                    }
+                )
+
+        # Reviewer mean-centering prevents harsh/generous grader bias when N >= 3.
+        reviewer_means = {
+            r: (sum(vals) / len(vals) if vals else 0.0) for r, vals in reviewer_totals.items()
+        }
+        for i in range(n):
+            rs = reviews[i]
+            acc = sum(x["accuracy"] for x in rs) / len(rs) if rs else 0.0
+            ins = sum(x["insight"] for x in rs) / len(rs) if rs else 0.0
+            centered = (
+                sum((x["accuracy"] + x["insight"]) - reviewer_means[x["reviewer"]] for x in rs) / len(rs)
+                if rs
+                else 0.0
+            )
+            leaderboard.append(
                 {
-                    "reviewer": r,
-                    "accuracy": max(1, min(10, int(round(float(item["accuracy"]))))),
-                    "insight": max(1, min(10, int(round(float(item["insight"]))))),
-                    "critique": str(item.get("critique", "")).strip(),
+                    "seat": i,
+                    "model": seats[i],
+                    "display_name": pretty_model(seats[i]),
+                    "accuracy": round(acc, 2),
+                    "insight": round(ins, 2),
+                    "total": round(acc + ins, 2),
+                    "centered_delta": round(centered, 2),
+                    "n": len(rs),
                 }
             )
-
-    leaderboard = []
-    for i in range(n):
-        rs = reviews[i]
-        acc = sum(x["accuracy"] for x in rs) / len(rs) if rs else 0.0
-        ins = sum(x["insight"] for x in rs) / len(rs) if rs else 0.0
-        leaderboard.append(
-            {
-                "seat": i,
-                "model": seats[i],
-                "display_name": pretty_model(seats[i]),
-                "accuracy": round(acc, 2),
-                "insight": round(ins, 2),
-                "total": round(acc + ins, 2),
-                "n": len(rs),
-            }
+        leaderboard.sort(
+            key=lambda b: (b["centered_delta"], b["total"], b["accuracy"]), reverse=True
         )
-    leaderboard.sort(key=lambda b: (b["total"], b["accuracy"], b["insight"]), reverse=True)
-
-    chair_arg = (args.chairman or "auto").strip().lower()
-    chair_idx = leaderboard[0]["seat"] if chair_arg == "auto" else int(chair_arg)
 
     order = list(range(n))
     random.shuffle(order)
@@ -406,49 +518,42 @@ def cmd_prepare_chairman(args: argparse.Namespace) -> None:
             f"- Accuracy {x['accuracy']}/10, Insight {x['insight']}/10: {x['critique']}"
             for x in reviews[j]
         )
-        sections.append(
-            f'<response label="{lab}">\n{answers[j]}\n</response>\n'
-            f'<peer_reviews label="{lab}">\n{crit_lines or "(none)"}\n</peer_reviews>'
-        )
+        block = f'<response label="{lab}" seat="{seat_label(j, seats)}">\n{answers[j]}\n</response>'
+        if crit_lines:
+            block += f'\n<peer_reviews label="{lab}">\n{crit_lines}\n</peer_reviews>'
+        sections.append(block)
 
     ctx_block = f"\n\n<context>\n{state['context']}\n</context>" if state["context"] else ""
-    t_note = tools_instruction(state["allow_tools"])
-    p_path = os.path.join(args.run_dir, "prompts", "stage3_chair.md")
+    bundle_path = os.path.join(args.run_dir, "prompts", "stage3_bundle.md")
     o_path = os.path.join(args.run_dir, "outputs", "stage3_chair.md")
-    prompt = (
-        "# Chairman Synthesis\n\n"
+    bundle = (
+        "# Coordinator Synthesis Bundle\n\n"
         "Synthesize the single definitive, authoritative final answer to the question below "
-        "using the anonymous panel responses and peer reviews.\n"
-        "- Incorporate the strongest insights and verified details.\n"
-        "- Correct any flaws or omissions identified in the peer reviews.\n"
+        "using the independent responses (and peer reviews, if present).\n"
+        "- Keep verified technical details and strongest insights from each seat.\n"
+        "- Correct flaws or omissions flagged during review.\n"
         "- Resolve disagreements explicitly.\n"
-        "- Do NOT mention 'Response A/B', scores, or the existence of a panel—present a clean, "
-        "standalone answer in Markdown.\n\n"
-        f"{t_note}{ctx_block}\n\n"
+        "- Write ONLY the clean final Markdown answer (no panel meta-commentary) to "
+        f"`{o_path}`.\n\n"
+        f"{ctx_block}\n\n"
         f"<question>\n{state['question']}\n</question>\n\n"
         + "\n\n".join(sections)
-        + f"\n\nWrite ONLY the final synthesized Markdown answer to `{o_path}`."
     )
-    write_text(p_path, prompt)
+    write_text(bundle_path, bundle)
 
     state["reviews"] = {str(k): v for k, v in reviews.items()}
     state["leaderboard"] = leaderboard
-    state["chairman"] = chair_idx
-    state["chairman_mode"] = chair_arg
     state["stage"] = "stage3"
     save_state(args.run_dir, state)
 
     print(
         json.dumps(
             {
-                "status": "stage3_ready",
-                "chairman_seat": chair_idx,
-                "chairman_model": seats[chair_idx],
+                "status": "coordinator_synthesis_ready",
+                "bundle_path": bundle_path,
+                "output_path": o_path,
                 "leaderboard": leaderboard,
-                "post_messages": [
-                    wakeup_message(workers[chair_idx], p_path, o_path, "stage3 chair done")
-                ],
-                "expected_outputs": [o_path],
+                "workers_to_kill": state["workers"],
             },
             indent=2,
         )
@@ -459,57 +564,69 @@ def cmd_finalize_council(args: argparse.Namespace) -> None:
     state = load_state(args.run_dir)
     seats = state["seats"]
     answers = state["answers"]
-    reviews = {int(k): v for k, v in state["reviews"].items()}
-    board = state["leaderboard"]
-    chair = state["chairman"]
-    auto_note = " *(Auto — Highest Peer-Rated)*" if state.get("chairman_mode") == "auto" else ""
+    reviews = {int(k): v for k, v in state.get("reviews", {}).items()}
+    board = state.get("leaderboard", [])
 
     chair_path = os.path.join(args.run_dir, "outputs", "stage3_chair.md")
     if not os.path.exists(chair_path):
-        raise SystemExit(f"Missing Chairman output: {chair_path}")
+        raise SystemExit(f"Missing synthesis output: {chair_path}")
     final_answer = read_text(chair_path).strip()
+
+    mode_note = (
+        "Cross-Vendor Peer-Reviewed Council (Coordinator Synthesis)"
+        if board
+        else "Fast Cross-Vendor Council (Parallel Answers + Coordinator Synthesis)"
+    )
 
     md = [
         f"# Council Deliberation — {state['question'][:80]}",
         "",
-        f"> [!IMPORTANT]\n> **Chairman Synthesis**: **{seat_label(chair, seats)}**{auto_note}",
+        f"> [!IMPORTANT]\n> **Mode**: {mode_note}",
         "",
         final_answer,
         "",
         "---",
         "",
-        "## Peer Review Leaderboard",
-        "",
-        "| Rank | Seat | Accuracy (1–10) | Insight (1–10) | Combined (/20) | Reviews |",
-        "| :--- | :--- | :---: | :---: | :---: | :---: |",
     ]
-    for rank, b in enumerate(board, 1):
-        md.append(
-            f"| {rank} | {seat_label(b['seat'], seats)} | {b['accuracy']:.1f} | "
-            f"{b['insight']:.1f} | **{b['total']:.1f}** | {b['n']} |"
-        )
 
-    md += ["", "## Individual Responses & Anonymized Critiques", "", "````carousel"]
+    if board:
+        md += [
+            "## Peer Review Leaderboard",
+            "",
+            "| Rank | Seat | Accuracy (1–10) | Insight (1–10) | Combined (/20) | Calibrated Delta | Reviews |",
+            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: |",
+        ]
+        for rank, b in enumerate(board, 1):
+            delta = f"{b.get('centered_delta', 0.0):+.2f}"
+            md.append(
+                f"| {rank} | {seat_label(b['seat'], seats)} | {b['accuracy']:.1f} | "
+                f"{b['insight']:.1f} | **{b['total']:.1f}** | {delta} | {b['n']} |"
+            )
+        md.append("")
+
+    md += ["## Individual Responses", "", "````carousel"]
     for i in range(len(seats)):
         if i > 0:
             md.append("<!-- slide -->")
-        md.append(f"### {seat_label(i, seats)}\n\n{answers[i]}\n\n#### Peer Critiques Received\n")
-        for r in reviews[i]:
-            md.append(
-                f"- **{seat_label(r['reviewer'], seats)}** *(Accuracy {r['accuracy']}/10, "
-                f"Insight {r['insight']}/10)*: {r['critique']}"
-            )
+        md.append(f"### {seat_label(i, seats)}\n\n{answers[i]}")
+        if reviews.get(i):
+            md.append("\n#### Peer Critiques Received\n")
+            for r in reviews[i]:
+                md.append(
+                    f"- **{seat_label(r['reviewer'], seats)}** *(Accuracy {r['accuracy']}/10, "
+                    f"Insight {r['insight']}/10)*: {r['critique']}"
+                )
     md.append("````")
 
     report_path = write_text(os.path.join(args.run_dir, "report.md"), "\n".join(md) + "\n")
     result = {
         "mode": "council",
+        "peer_review": bool(board),
         "question": state["question"],
         "seats": seats,
-        "chairman": chair,
         "leaderboard": board,
         "answers": answers,
-        "reviews": state["reviews"],
+        "reviews": state.get("reviews", {}),
         "final": final_answer,
     }
     write_text(os.path.join(args.run_dir, "result.json"), json.dumps(result, indent=2))
@@ -591,17 +708,21 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
     turn = state["turn_number"]
     p = state["active_participant"]
 
-    out_path = os.path.join(args.run_dir, "outputs", f"turn_{turn}.json")
-    if not os.path.exists(out_path):
-        raise SystemExit(f"Missing Turn {turn} output: {out_path}")
+    meta_path = os.path.join(args.run_dir, "outputs", f"turn_{turn}.meta.json")
+    plan_path = os.path.join(args.run_dir, "outputs", f"turn_{turn}.plan.md")
+    if not os.path.exists(meta_path):
+        raise SystemExit(f"Missing Turn {turn} metadata: {meta_path}")
 
-    parsed = parse_json_lenient(read_text(out_path))
-    new_plan = str(parsed.get("plan", "")).strip()
-    notes = str(parsed.get("revision_notes", "")).strip()
+    parsed = parse_json_lenient(read_text(meta_path))
+    notes = str(parsed.get("revision_notes") or "").strip()
     claimed_agreed = bool(parsed.get("agreed", False))
 
-    if not new_plan:
-        raise SystemExit(f"Turn {turn} returned an empty plan")
+    if os.path.exists(plan_path) and os.path.getsize(plan_path) > 0:
+        new_plan = read_text(plan_path).strip()
+    elif turn > 1 and claimed_agreed and state["current_plan"]:
+        new_plan = state["current_plan"]
+    else:
+        raise SystemExit(f"Missing Turn {turn} plan file: {plan_path}")
 
     if state["consolidation_pending"]:
         state["version"] += 1
@@ -644,7 +765,7 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
         state["endorsed"] = [p]
         effective_agreed = False
     else:
-        changed = norm_text(new_plan) != norm_text(state["current_plan"])
+        changed = norm_plan(new_plan) != norm_plan(state["current_plan"])
         if claimed_agreed and not changed:
             if p not in state["endorsed"]:
                 state["endorsed"].append(p)
@@ -687,7 +808,6 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
         )
         return
 
-    # Find next participant with remaining turns
     next_p = None
     for offset in range(1, k + 1):
         cand = (p + offset) % k
@@ -699,26 +819,24 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
     t_note = tools_instruction(state["allow_tools"])
     next_turn = turn + 1
     p_path = os.path.join(args.run_dir, "prompts", f"turn_{next_turn}.md")
-    o_path = os.path.join(args.run_dir, "outputs", f"turn_{next_turn}.json")
+    next_meta = os.path.join(args.run_dir, "outputs", f"turn_{next_turn}.meta.json")
+    next_plan = os.path.join(args.run_dir, "outputs", f"turn_{next_turn}.plan.md")
 
     if next_p is None:
-        # Deadlock fallback -> Participant 1 consolidates
         state["consolidation_pending"] = True
         state["turn_number"] = next_turn
         state["active_participant"] = 0
         prompt = (
             f"# Final Plan Consolidation — Turn {next_turn}\n\n"
+            f"<request>\n{state['question']}\n</request>\n\n"
             "We have reached the maximum revision budget. Produce the final consolidated "
             "standalone Markdown plan from the latest draft below: preserve the strongest "
-            "decisions, resolve any remaining tensions explicitly in a concise "
-            "'Key Trade-offs & Decisions' section, and set `agreed` to `true`.\n\n"
+            "decisions and resolve any remaining tensions explicitly in a concise "
+            "'Key Trade-offs & Decisions' section.\n\n"
             f"<draft version=\"{state['version']}\">\n{state['current_plan']}\n</draft>\n\n"
-            f"Write ONLY a valid JSON object to `{o_path}`:\n"
-            '{\n'
-            '  "revision_notes": "Summary of final consolidation",\n'
-            '  "plan": "<Complete standalone canonical Markdown plan>",\n'
-            '  "agreed": true\n'
-            '}\n'
+            "Write TWO files:\n"
+            f"1. `{next_plan}` — the complete final standalone Markdown plan.\n"
+            f"2. `{next_meta}` — `{{\"revision_notes\": \"Summary of final consolidation\", \"agreed\": true}}`\n"
         )
         write_text(p_path, prompt)
         save_state(args.run_dir, state)
@@ -730,9 +848,11 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
                     "consolidation": True,
                     "swarm_add": [],
                     "post_messages": [
-                        wakeup_message(workers[0], p_path, o_path, f"turn {next_turn} done")
+                        direct_wakeup(
+                            workers[0], p_path, f"`{next_plan}` and `{next_meta}`", f"turn {next_turn} done"
+                        )
                     ],
-                    "expected_outputs": [o_path],
+                    "expected_outputs": [next_meta, next_plan],
                 },
                 indent=2,
             )
@@ -740,44 +860,35 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
         return
 
     first_time = next_p not in state["spawned_participants"]
-    intro = (
-        "You are working one-on-one to craft and refine a rigorous, production-grade plan.\n"
-        f"{t_note}{ctx_block}\n\n<request>\n{state['question']}\n</request>\n\n"
-        if first_time
-        else ""
-    )
     prompt = (
         f"# Plan Review — Turn {next_turn} (Draft v{state['version']})\n\n"
-        f"{intro}"
-        "Below is the latest draft of the plan. Evaluate it critically on technical merit, "
-        "completeness, edge cases, sequencing, and clarity.\n"
-        "- Always return the COMPLETE standalone canonical Markdown plan in `plan` (never a diff or partial).\n"
-        "- Set `agreed` to `true` ONLY if you endorse this exact draft as-is with zero modifications.\n"
-        "- If you improve or change anything at all, set `agreed` to `false`.\n\n"
-        f"<draft version=\"{state['version']}\">\n{state['current_plan']}\n</draft>\n\n"
-        f"Write ONLY a valid JSON object to `{o_path}`:\n"
-        '{\n'
-        '  "revision_notes": "What you changed and why (or why you endorse unchanged)",\n'
-        '  "plan": "<Complete standalone canonical Markdown plan>",\n'
-        '  "agreed": false\n'
-        '}\n'
+        "You are working one-on-one to refine a rigorous, production-grade plan.\n"
+        f"{t_note}{ctx_block}\n\n"
+        f"<request>\n{state['question']}\n</request>\n\n"
+        "Evaluate the draft below on technical merit, completeness, edge cases, sequencing, and clarity.\n"
+        f"- **If you endorse this exact draft as-is**: write ONLY `{next_meta}` with "
+        "`{\"revision_notes\": \"Why you endorse as-is\", \"agreed\": true}` and do NOT write a plan file.\n"
+        f"- **If you change anything**: write the COMPLETE updated Markdown plan to `{next_plan}`, "
+        f"and write `{next_meta}` with `{{\"revision_notes\": \"What you changed and why\", \"agreed\": false}}`.\n\n"
+        f"<draft version=\"{state['version']}\">\n{state['current_plan']}\n</draft>\n"
     )
     write_text(p_path, prompt)
 
     swarm_add = []
     post_messages = []
+    out_desc = f"`{next_meta}` (and `{next_plan}` only if revised)"
     if first_time:
         state["spawned_participants"].append(next_p)
         swarm_add.append(
             {
                 "name": workers[next_p],
                 "model": seats[slot_order[next_p]],
-                "brief": worker_brief(workers[next_p], p_path, o_path, f"turn {next_turn} done"),
+                "brief": direct_brief(workers[next_p], p_path, out_desc, f"turn {next_turn} done"),
             }
         )
     else:
         post_messages.append(
-            wakeup_message(workers[next_p], p_path, o_path, f"turn {next_turn} done")
+            direct_wakeup(workers[next_p], p_path, out_desc, f"turn {next_turn} done")
         )
 
     state["turn_number"] = next_turn
@@ -790,7 +901,105 @@ def cmd_step_consensus(args: argparse.Namespace) -> None:
                 "turn": next_turn,
                 "swarm_add": swarm_add,
                 "post_messages": post_messages,
-                "expected_outputs": [o_path],
+                "expected_outputs": [next_meta],
+            },
+            indent=2,
+        )
+    )
+
+
+# ───────────────────────── RECOVERY & SWAP ───────────────────────────
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    state = load_state(args.run_dir)
+    mode = state["mode"]
+    if mode == "council":
+        stage = state["stage"]
+        n = len(state["seats"])
+        ext = "md" if stage == "stage1" else "json"
+        if stage in ("stage1", "stage2"):
+            missing = []
+            wakeups = []
+            for i in range(n):
+                o_path = os.path.join(args.run_dir, "outputs", f"{stage}_{i}.{ext}")
+                p_path = os.path.join(args.run_dir, "prompts", f"{stage}_{i}.md")
+                if not os.path.exists(o_path) or os.path.getsize(o_path) == 0:
+                    missing.append(o_path)
+                    wakeups.append(
+                        barrier_wakeup(state["workers"][i], args.run_dir, stage, i, p_path, o_path)
+                    )
+            print(
+                json.dumps(
+                    {
+                        "mode": "council",
+                        "stage": stage,
+                        "missing_outputs": missing,
+                        "post_messages": wakeups,
+                    },
+                    indent=2,
+                )
+            )
+            return
+        print(
+            json.dumps(
+                {
+                    "mode": "council",
+                    "stage": stage,
+                    "bundle_path": os.path.join(args.run_dir, "prompts", "stage3_bundle.md"),
+                    "output_path": os.path.join(args.run_dir, "outputs", "stage3_chair.md"),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    turn = state["turn_number"]
+    p = state["active_participant"]
+    p_path = os.path.join(args.run_dir, "prompts", f"turn_{turn}.md")
+    meta_path = os.path.join(args.run_dir, "outputs", f"turn_{turn}.meta.json")
+    plan_path = os.path.join(args.run_dir, "outputs", f"turn_{turn}.plan.md")
+    print(
+        json.dumps(
+            {
+                "mode": "consensus",
+                "turn": turn,
+                "active_participant": p + 1,
+                "post_messages": [
+                    direct_wakeup(
+                        state["workers"][p],
+                        p_path,
+                        f"`{meta_path}` (and `{plan_path}` if revised)",
+                        f"turn {turn} done",
+                    )
+                ],
+                "expected_outputs": [meta_path],
+            },
+            indent=2,
+        )
+    )
+
+
+def cmd_swap_seat(args: argparse.Namespace) -> None:
+    state = load_state(args.run_dir)
+    idx = args.seat
+    if not (0 <= idx < len(state["seats"])):
+        raise SystemExit(f"Invalid seat index {idx}")
+    old_model = state["seats"][idx]
+    state["seats"][idx] = args.model
+    new_name = f"seat{idx}-{state['tag']}-r" if state["mode"] == "council" else f"p{idx + 1}-{state['tag']}-r"
+    old_name = state["workers"][idx]
+    state["workers"][idx] = new_name
+    save_state(args.run_dir, state)
+    print(
+        json.dumps(
+            {
+                "status": "swapped",
+                "seat": idx,
+                "old_model": old_model,
+                "new_model": args.model,
+                "kill_worker": old_name,
+                "new_worker": new_name,
             },
             indent=2,
         )
@@ -813,9 +1022,16 @@ def main() -> None:
     p_init.add_argument("--question-file", default="")
     p_init.add_argument("--context", default="")
     p_init.add_argument("--context-file", default="")
-    p_init.add_argument("--max-rounds", type=int, default=3)
+    p_init.add_argument("--max-rounds", type=int, default=2)
     p_init.add_argument("--allow-tools", action="store_true", default=False)
+    p_init.add_argument("--peer-review", action="store_true", default=False)
     p_init.set_defaults(func=cmd_init)
+
+    p_mark = sub.add_parser("mark-done")
+    p_mark.add_argument("--run-dir", required=True)
+    p_mark.add_argument("--stage", required=True, choices=["stage1", "stage2"])
+    p_mark.add_argument("--seat", required=True, type=int)
+    p_mark.set_defaults(func=cmd_mark_done)
 
     p_rev = sub.add_parser("prepare-reviews")
     p_rev.add_argument("--run-dir", required=True)
@@ -823,7 +1039,6 @@ def main() -> None:
 
     p_chair = sub.add_parser("prepare-chairman")
     p_chair.add_argument("--run-dir", required=True)
-    p_chair.add_argument("--chairman", default="auto")
     p_chair.set_defaults(func=cmd_prepare_chairman)
 
     p_fin = sub.add_parser("finalize-council")
@@ -833,6 +1048,16 @@ def main() -> None:
     p_step = sub.add_parser("step-consensus")
     p_step.add_argument("--run-dir", required=True)
     p_step.set_defaults(func=cmd_step_consensus)
+
+    p_res = sub.add_parser("resume")
+    p_res.add_argument("--run-dir", required=True)
+    p_res.set_defaults(func=cmd_resume)
+
+    p_swap = sub.add_parser("swap-seat")
+    p_swap.add_argument("--run-dir", required=True)
+    p_swap.add_argument("--seat", required=True, type=int)
+    p_swap.add_argument("--model", required=True)
+    p_swap.set_defaults(func=cmd_swap_seat)
 
     parsed = parser.parse_args()
     parsed.func(parsed)
